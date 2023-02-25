@@ -57,6 +57,8 @@ from statsmodels.tools.tools import pinv_extended
 from statsmodels.tools.typing import Float64Array
 from statsmodels.tools.validation import bool_like, float_like, string_like
 
+from statsmodels.regression.wildboottest import wildboottestHC, wildboottestCL
+
 from . import _prediction as pred
 
 __docformat__ = 'restructuredtext en'
@@ -3026,6 +3028,7 @@ class OLSResults(RegressionResults):
     - outlier_test
     - el_test
     - conf_int_el
+    - wildboottest
     """
 
     def get_influence(self):
@@ -3266,6 +3269,142 @@ class OLSResults(RegressionResults):
                                  upper_bound)
         #  ^ Seems to be faster than brentq in most cases
         return (lowerl, upperl)
+
+
+
+    def wildboottest(self : 'OLS',
+                     B:int,
+                     cluster : Union[np.ndarray, pd.Series, pd.DataFrame, None] = None,
+                     param : Union[str, None] = None,
+                     weights_type: str = 'rademacher',
+                     impose_null: bool = True,
+                     bootstrap_type: str = '11',
+                     seed: Union[str, None] = None,
+                     adj: bool = True,
+                     cluster_adj: bool = True,
+                     show=True) -> pd.DataFrame:
+
+        """Run a wild cluster bootstrap based on an object of class 'statsmodels.regression.linear_model.OLS'
+
+                Args:
+                    model (OLS):  A statsmodels regression object
+                    B (int): The number of bootstrap iterations to run
+                    cluster (Union[None, np.ndarray, pd.Series, pd.DataFrame], optional): If None (default), a 'heteroskedastic' wild boostrap
+                        is run. For a wild cluster bootstrap, requires a numpy array of dimension one,a  pandas Series or DataFrame, containing the clustering variable.
+                    param (Union[str, None], optional): A string of length one, containing the test parameter of interest. Defaults to None.
+                    weights_type (str, optional): The type of bootstrap weights. Either 'rademacher', 'mammen', 'webb' or 'normal'.
+                                        'rademacher' by default. Defaults to 'rademacher'.
+                    impose_null (bool, optional): Should the null hypothesis be imposed on the bootstrap dgp, or not?
+                                        Defaults to True.
+                    bootstrap_type (str, optional):A string of length one. Allows to choose the bootstrap type
+                                        to be run. Either '11', '31', '13' or '33'. '11' by default. Defaults to '11'.
+                    seed (Union[str, None], optional): Option to provide a random seed. Defaults to None.
+                Raises:
+                    Exception: Raises if `param` is not a string
+                Returns:
+                    pd.DataFrame: A wild cluster bootstrapped p-value(s).
+
+                Example:
+
+                >>> from wildboottest.wildboottest import wildboottest
+                >>> import statsmodels.api as sm
+                >>> import numpy as np
+                >>> import pandas as pd
+
+                >>> np.random.seed(12312312)
+                >>> N = 1000
+                >>> k = 10
+                >>> G = 10
+                >>> X = np.random.normal(0, 1, N * k).reshape((N,k))
+                >>> X = pd.DataFrame(X)
+                >>> X.rename(columns = {0:"X1"}, inplace = True)
+                >>> beta = np.random.normal(0,1,k)
+                >>> beta[0] = 0.005
+                >>> u = np.random.normal(0,1,N)
+                >>> Y = 1 + X @ beta + u
+                >>> cluster = np.random.choice(list(range(0,G)), N)
+                >>> model = sm.OLS(Y, X)
+                >>> wildboottest(model, param = "X1", B = 9999)
+                >>> wildboottest(model, param = "X1", cluster = cluster, B = 9999)
+                >>> wildboottest(model, cluster = cluster, B = 9999)
+        """
+
+        # does model.exog already exclude missing values?
+        X = self.exog
+        # interestingly, the dependent variable is called 'endogeneous'
+        Y = self.endog
+        # weights not yet used, only as a placeholder
+        weights = model.weights
+
+        xnames = self.data.xnames
+        ynames = self.data.ynames
+
+        pvalues = []
+        tstats = []
+
+        def generate_stats(param, cluster):
+
+            R = np.zeros(len(xnames))
+            R[xnames.index(param)] = 1
+            r = 0
+            # Just test for beta=0
+
+            # is it possible to fetch the clustering variables from the pre-processed data
+            # frame, e.g. with 'excluding' observations with missings etc
+            # cluster = ...
+
+            if cluster is None:
+
+                boot = WildboottestHC(X = X, Y = Y, R = R, r = r, B = B, seed = seed)
+                boot.get_adjustments(bootstrap_type = bootstrap_type)
+                boot.get_uhat(impose_null = impose_null)
+                boot.get_tboot(weights_type = weights_type)
+                boot.get_tstat()
+                boot.get_pvalue(pval_type = "two-tailed")
+                full_enumeration_warn = False
+
+            else:
+
+                boot = WildboottestCL(X = X, Y = Y, cluster = cluster,
+                                    R = R, B = B, seed = seed)
+                boot.get_scores(bootstrap_type = bootstrap_type, impose_null = impose_null, adj=adj, cluster_adj=cluster_adj)
+                _, _, full_enumeration_warn = boot.get_weights(weights_type = weights_type)
+                boot.get_numer()
+                boot.get_denom()
+                boot.get_tboot()
+                boot.get_vcov()
+                boot.get_tstat()
+                boot.get_pvalue(pval_type = "two-tailed")
+
+            pvalues.append(boot.pvalue)
+            tstats.append(boot.t_stat)
+
+            return pvalues, tstats, full_enumeration_warn
+
+        if param is None:
+            for x in xnames:
+                pvalues, tstats, full_enumeration_warn = generate_stats(x, cluster=cluster)
+            param = xnames
+        elif isinstance(param, str):
+            pvalues, tstats, full_enumeration_warn = generate_stats(param, cluster=cluster)
+        else:
+            raise Exception("`param` not correctly specified")
+
+        if full_enumeration_warn:
+            warnings.warn("2^G < the number of boot iterations, setting full_enumeration to True.")
+
+        res = {
+            'param': param,
+            'statistic': tstats,
+            'p-value': pvalues
+        }
+
+        res_df = pd.DataFrame(res).set_index('param')
+
+        if show:
+            print(res_df.to_markdown(floatfmt=".3f"))
+
+        return res_df
 
 
 class RegressionResultsWrapper(wrap.ResultsWrapper):
